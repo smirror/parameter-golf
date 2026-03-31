@@ -9,7 +9,8 @@ Usage:
   bash mlx_local.sh
   bash mlx_local.sh setup
   bash mlx_local.sh download [train_shards]
-  bash mlx_local.sh run [standard|sliding|selective_qat|mlp_qat]
+  bash mlx_local.sh run [standard|sliding|selective_qat|mlp_qat|rowwise_ptq|gptq_lite_ptq]
+  bash mlx_local.sh quantize <model_path> [standard|sliding|rowwise_ptq|gptq_lite_ptq]
   bash mlx_local.sh compare <model_path> [stride]
 
 Examples:
@@ -20,6 +21,9 @@ Examples:
   bash mlx_local.sh run sliding
   bash mlx_local.sh run selective_qat
   bash mlx_local.sh run mlp_qat
+  bash mlx_local.sh run rowwise_ptq
+  bash mlx_local.sh run gptq_lite_ptq
+  bash mlx_local.sh quantize logs/my_run_mlx_model.npz rowwise_ptq
   bash mlx_local.sh compare logs/my_run_mlx_model.int8.ptz
 
 Optional environment variables for `run`:
@@ -42,6 +46,10 @@ Optional environment variables for `run`:
   INT6_LAYER_END
   QAT_START_STEP
   QAT_BITS
+  PTQ_METHOD
+  PTQ_CALIB_BATCHES
+  PTQ_CALIB_TOKENS
+  PTQ_TARGET
   MUON_WEIGHT_DECAY
   ADAM_WEIGHT_DECAY
   SEED
@@ -107,6 +115,8 @@ cmd_setup() {
     echo "  bash mlx_local.sh run standard"
     echo "  bash mlx_local.sh run selective_qat"
     echo "  bash mlx_local.sh run mlp_qat"
+    echo "  bash mlx_local.sh run rowwise_ptq"
+    echo "  bash mlx_local.sh run gptq_lite_ptq"
 }
 
 cmd_download() {
@@ -152,10 +162,16 @@ cmd_run() {
     local int6_layer_end="${INT6_LAYER_END:--1}"
     local qat_start_step="${QAT_START_STEP:--1}"
     local qat_bits="${QAT_BITS:-0}"
+    local ptq_method="${PTQ_METHOD:-none}"
+    local ptq_calib_batches="${PTQ_CALIB_BATCHES:-1}"
+    local ptq_calib_tokens="${PTQ_CALIB_TOKENS:-0}"
+    local ptq_target="${PTQ_TARGET:-lowbit}"
     local muon_weight_decay="${MUON_WEIGHT_DECAY:-0.0}"
     local adam_weight_decay="${ADAM_WEIGHT_DECAY:-0.0}"
     local seed="${SEED:-1337}"
     local run_id="${RUN_ID:-mlx_${mode}_$(date +%Y%m%d_%H%M%S)}"
+    local quantize_only="${QUANTIZE_ONLY:-0}"
+    local load_model_path="${LOAD_MODEL_PATH:-}"
     local eval_stride
 
     case "${mode}" in
@@ -198,8 +214,56 @@ cmd_run() {
                 qat_bits=0
             fi
             ;;
+        rowwise_ptq)
+            eval_stride="${EVAL_STRIDE:-64}"
+            if [[ -z "${QUANT_PACK+x}" ]]; then
+                quant_pack=1
+            fi
+            if [[ -z "${INT6_SCOPE+x}" ]]; then
+                int6_scope=mlp
+            fi
+            if [[ -z "${PTQ_METHOD+x}" ]]; then
+                ptq_method=rowwise
+            fi
+            if [[ -z "${PTQ_TARGET+x}" ]]; then
+                ptq_target=lowbit
+            fi
+            if [[ -z "${PTQ_CALIB_BATCHES+x}" ]]; then
+                ptq_calib_batches=4
+            fi
+            if [[ -z "${PTQ_CALIB_TOKENS+x}" ]]; then
+                ptq_calib_tokens=0
+            fi
+            if [[ -z "${VAL_MAX_BATCHES+x}" ]]; then
+                val_max_batches=8
+            fi
+            ;;
+        gptq_lite_ptq)
+            eval_stride="${EVAL_STRIDE:-64}"
+            if [[ -z "${QUANT_PACK+x}" ]]; then
+                quant_pack=1
+            fi
+            if [[ -z "${INT6_SCOPE+x}" ]]; then
+                int6_scope=mlp
+            fi
+            if [[ -z "${PTQ_METHOD+x}" ]]; then
+                ptq_method=gptq_lite
+            fi
+            if [[ -z "${PTQ_TARGET+x}" ]]; then
+                ptq_target=lowbit
+            fi
+            if [[ -z "${PTQ_CALIB_BATCHES+x}" ]]; then
+                ptq_calib_batches=4
+            fi
+            if [[ -z "${PTQ_CALIB_TOKENS+x}" ]]; then
+                ptq_calib_tokens=0
+            fi
+            if [[ -z "${VAL_MAX_BATCHES+x}" ]]; then
+                val_max_batches=8
+            fi
+            ;;
         *)
-            echo "Usage: bash mlx_local.sh run [standard|sliding|selective_qat|mlp_qat]" >&2
+            echo "Usage: bash mlx_local.sh run [standard|sliding|selective_qat|mlp_qat|rowwise_ptq|gptq_lite_ptq]" >&2
             exit 1
             ;;
     esac
@@ -221,6 +285,12 @@ cmd_run() {
     echo "int6_layer_end=${int6_layer_end}"
     echo "qat_start_step=${qat_start_step}"
     echo "qat_bits=${qat_bits}"
+    echo "ptq_method=${ptq_method}"
+    echo "ptq_calib_batches=${ptq_calib_batches}"
+    echo "ptq_calib_tokens=${ptq_calib_tokens}"
+    echo "ptq_target=${ptq_target}"
+    echo "quantize_only=${quantize_only}"
+    echo "load_model_path=${load_model_path:--}"
     echo "muon_weight_decay=${muon_weight_decay}"
     echo "adam_weight_decay=${adam_weight_decay}"
 
@@ -243,10 +313,34 @@ cmd_run() {
     INT6_LAYER_END="${int6_layer_end}" \
     QAT_START_STEP="${qat_start_step}" \
     QAT_BITS="${qat_bits}" \
+    PTQ_METHOD="${ptq_method}" \
+    PTQ_CALIB_BATCHES="${ptq_calib_batches}" \
+    PTQ_CALIB_TOKENS="${ptq_calib_tokens}" \
+    PTQ_TARGET="${ptq_target}" \
+    QUANTIZE_ONLY="${quantize_only}" \
+    LOAD_MODEL_PATH="${load_model_path}" \
     MUON_WEIGHT_DECAY="${muon_weight_decay}" \
     ADAM_WEIGHT_DECAY="${adam_weight_decay}" \
     SEED="${seed}" \
     python3 train_gpt_mlx.py
+}
+
+cmd_quantize() {
+    local model_path="${1:-}"
+    local mode="${2:-standard}"
+
+    if [[ -z "${model_path}" ]]; then
+        echo "Usage: bash mlx_local.sh quantize <model_path> [standard|sliding|rowwise_ptq|gptq_lite_ptq]" >&2
+        exit 1
+    fi
+    if [[ ! -f "${model_path}" ]]; then
+        echo "Model file not found: ${model_path}" >&2
+        exit 1
+    fi
+
+    local run_id="${RUN_ID:-mlx_quantize_${mode}_$(date +%Y%m%d_%H%M%S)}"
+    echo "quantize_model=${model_path}"
+    QUANTIZE_ONLY=1 LOAD_MODEL_PATH="${model_path}" RUN_ID="${run_id}" cmd_run "${mode}"
 }
 
 cmd_compare() {
@@ -377,6 +471,10 @@ main() {
         run)
             shift
             cmd_run "$@"
+            ;;
+        quantize)
+            shift
+            cmd_quantize "$@"
             ;;
         compare)
             shift
