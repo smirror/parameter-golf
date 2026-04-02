@@ -72,6 +72,9 @@ class Hyperparameters:
     eval_only: bool = bool(int(os.environ.get("EVAL_ONLY", "0")))
     quantize_only: bool = bool(int(os.environ.get("QUANTIZE_ONLY", "0")))
     load_model_path: str = os.environ.get("LOAD_MODEL_PATH", "")
+    ema_enabled: bool = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    ema_decay: float = float(os.environ.get("EMA_DECAY", 0.997))
+    ema_start_step: int = int(os.environ.get("EMA_START_STEP", -1))
 
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -1686,6 +1689,26 @@ def clip_grad_tree(grads_tree: dict, max_norm: float) -> dict:
     return tree_unflatten([(k, g * scale) for k, g in flat.items()])
 
 
+def clone_flat_state(flat_state: dict[str, mx.array]) -> dict[str, mx.array]:
+    return {name: mx.array(arr) for name, arr in flat_state.items()}
+
+
+def update_ema_flat_state(
+    ema_flat: dict[str, mx.array],
+    current_flat: dict[str, mx.array],
+    decay: float,
+) -> dict[str, mx.array]:
+    one_minus_decay = 1.0 - decay
+    updated: dict[str, mx.array] = {}
+    for name, arr in current_flat.items():
+        prev = ema_flat[name]
+        if mx.issubdtype(arr.dtype, mx.floating):
+            updated[name] = prev * decay + arr.astype(prev.dtype) * one_minus_decay
+        else:
+            updated[name] = mx.array(arr)
+    return updated
+
+
 def main() -> None:
     # ==============================================================================
     # TOKENIZER + VALIDATION METRIC SETUP
@@ -1708,6 +1731,10 @@ def main() -> None:
         raise ValueError("EVAL_ONLY and QUANTIZE_ONLY are mutually exclusive")
     if args.ptq_method != "none" and args.ptq_calib_tokens <= 0 and args.ptq_calib_batches <= 0:
         raise ValueError("PTQ_METHOD requires PTQ_CALIB_TOKENS > 0 or PTQ_CALIB_BATCHES > 0")
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError(f"EMA_DECAY must be in [0, 1), got {args.ema_decay}")
+    if args.ema_start_step < -1:
+        raise ValueError(f"EMA_START_STEP must be >= -1, got {args.ema_start_step}")
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     logfile = out_dir / f"{args.run_id}.txt"
@@ -1845,6 +1872,7 @@ def main() -> None:
         f"muon_weight_decay:{args.muon_weight_decay} adam_weight_decay:{args.adam_weight_decay} "
         f"muon_momentum:{args.muon_momentum} muon_steps:{args.muon_backend_steps}"
     )
+    log(f"ema:enabled:{args.ema_enabled} decay:{args.ema_decay:.6f} start_step:{args.ema_start_step}")
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
@@ -1947,6 +1975,7 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
     stop_after_step: int | None = None
     qat_activated = False
+    ema_flat: dict[str, mx.array] | None = None
     t0 = time.perf_counter()
     step = 0
     while True:
@@ -1996,6 +2025,10 @@ def main() -> None:
         grads = clip_grad_tree(grads, args.grad_clip_norm)
         train_loss_value = float(train_loss.item())
         opt.step(model, grads, step=step, lr_mul=lr_mul)
+        if args.ema_enabled and step >= max(args.ema_start_step, 0):
+            current_flat = {k: v for k, v in tree_flatten(model.state)}
+            ema_flat = clone_flat_state(current_flat) if ema_flat is None else update_ema_flat_state(ema_flat, current_flat, args.ema_decay)
+            mx.eval(*ema_flat.values())
         mx.synchronize()
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
@@ -2016,6 +2049,9 @@ def main() -> None:
     # We always write a raw artifact and a quantized artifact, then validate the
     # quantized roundtrip directly by loading the dequantized tensors back into the
     # model and running one final validation pass.
+    if args.ema_enabled and ema_flat is not None:
+        log(f"ema_export:enabled decay:{args.ema_decay:.6f}")
+        model.update(tree_unflatten(list(ema_flat.items())))
     export_quantized_roundtrip(
         args,
         model,

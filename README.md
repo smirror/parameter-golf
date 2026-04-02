@@ -151,7 +151,33 @@ Current full-eval result on the shared `mlx_mlp_qat_ref` checkpoint:
 | `mlx_mlp_qat_ref_full` | `8+int6:mlp` | 2.35998300 | +0.00000000 |
 | `mlx_mlp_qat_rowwise_full` | `8+int6:mlp+ptq:rowwise` | 2.35765652 | -0.00232648 |
 
-At the moment, `rowwise_ptq` is the recommended local PTQ path for this MLX setup. It improves `val_bpb` on the exact same checkpoint with essentially unchanged evaluation time. A lighter proxy comparison with `gptq_lite_ptq` did not show a meaningful gain over the baseline, so `rowwise_ptq` is the method worth carrying forward first.
+`rowwise_ptq` helps on the `mlp_qat` stack, but it did not transfer to the stronger local selective-int6 recipe. The current best local direction is `selective_qat + late EMA`.
+
+Current full-eval result on the selective-int6 stack:
+
+| Run | Quantized label | `val_bpb` | Delta vs baseline |
+|-----|-----------------|----------:|------------------:|
+| `mlx_selective_qat_ref_full` | `8+int6[2-6]` | 2.34746283 | +0.00000000 |
+| `mlx_selective_qat_ema_ref_full` | `8+int6[2-6]` | 2.23347297 | -0.11398986 |
+
+The recommended local runner for this stack is:
+
+```bash
+RUN_ID=mlx_selective_qat_ema_ref \
+EMA_ENABLED=1 \
+EMA_DECAY=0.98 \
+EMA_START_STEP=150 \
+VAL_MAX_BATCHES=8 \
+bash mlx_local.sh run selective_qat
+```
+
+For convenience, the same defaults are bundled into:
+
+```bash
+bash mlx_local.sh run selective_qat_ema
+```
+
+On this local setup, late EMA was a much stronger improvement than rowwise PTQ, and the quantized artifact also got smaller.
 
 ### Scaling Up to a Remote Machine
 

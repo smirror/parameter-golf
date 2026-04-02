@@ -9,8 +9,8 @@ Usage:
   bash mlx_local.sh
   bash mlx_local.sh setup
   bash mlx_local.sh download [train_shards]
-  bash mlx_local.sh run [standard|sliding|selective_qat|mlp_qat|rowwise_ptq|gptq_lite_ptq]
-  bash mlx_local.sh quantize <model_path> [standard|sliding|rowwise_ptq|gptq_lite_ptq]
+  bash mlx_local.sh run [standard|sliding|selective_qat|selective_qat_ema|mlp_qat|rowwise_ptq|gptq_lite_ptq]
+  bash mlx_local.sh quantize <model_path> [standard|sliding|selective_qat|rowwise_ptq|gptq_lite_ptq]
   bash mlx_local.sh compare <model_path> [stride]
 
 Examples:
@@ -20,6 +20,7 @@ Examples:
   bash mlx_local.sh run standard
   bash mlx_local.sh run sliding
   bash mlx_local.sh run selective_qat
+  bash mlx_local.sh run selective_qat_ema
   bash mlx_local.sh run mlp_qat
   bash mlx_local.sh run rowwise_ptq
   bash mlx_local.sh run gptq_lite_ptq
@@ -50,6 +51,9 @@ Optional environment variables for `run`:
   PTQ_CALIB_BATCHES
   PTQ_CALIB_TOKENS
   PTQ_TARGET
+  EMA_ENABLED
+  EMA_DECAY
+  EMA_START_STEP
   MUON_WEIGHT_DECAY
   ADAM_WEIGHT_DECAY
   SEED
@@ -114,6 +118,7 @@ cmd_setup() {
     echo "  bash mlx_local.sh"
     echo "  bash mlx_local.sh run standard"
     echo "  bash mlx_local.sh run selective_qat"
+    echo "  bash mlx_local.sh run selective_qat_ema"
     echo "  bash mlx_local.sh run mlp_qat"
     echo "  bash mlx_local.sh run rowwise_ptq"
     echo "  bash mlx_local.sh run gptq_lite_ptq"
@@ -166,6 +171,9 @@ cmd_run() {
     local ptq_calib_batches="${PTQ_CALIB_BATCHES:-1}"
     local ptq_calib_tokens="${PTQ_CALIB_TOKENS:-0}"
     local ptq_target="${PTQ_TARGET:-lowbit}"
+    local ema_enabled="${EMA_ENABLED:-0}"
+    local ema_decay="${EMA_DECAY:-0.997}"
+    local ema_start_step="${EMA_START_STEP:--1}"
     local muon_weight_decay="${MUON_WEIGHT_DECAY:-0.0}"
     local adam_weight_decay="${ADAM_WEIGHT_DECAY:-0.0}"
     local seed="${SEED:-1337}"
@@ -197,6 +205,36 @@ cmd_run() {
             fi
             if [[ -z "${QAT_BITS+x}" ]]; then
                 qat_bits=0
+            fi
+            ;;
+        selective_qat_ema)
+            eval_stride="${EVAL_STRIDE:-64}"
+            if [[ -z "${QUANT_PACK+x}" ]]; then
+                quant_pack=1
+            fi
+            if [[ -z "${INT6_LAYER_START+x}" ]]; then
+                int6_layer_start=2
+            fi
+            if [[ -z "${INT6_LAYER_END+x}" ]]; then
+                int6_layer_end=6
+            fi
+            if [[ -z "${QAT_START_STEP+x}" ]]; then
+                qat_start_step=150
+            fi
+            if [[ -z "${QAT_BITS+x}" ]]; then
+                qat_bits=0
+            fi
+            if [[ -z "${EMA_ENABLED+x}" ]]; then
+                ema_enabled=1
+            fi
+            if [[ -z "${EMA_DECAY+x}" ]]; then
+                ema_decay=0.98
+            fi
+            if [[ -z "${EMA_START_STEP+x}" ]]; then
+                ema_start_step=150
+            fi
+            if [[ -z "${VAL_MAX_BATCHES+x}" ]]; then
+                val_max_batches=8
             fi
             ;;
         mlp_qat)
@@ -263,7 +301,7 @@ cmd_run() {
             fi
             ;;
         *)
-            echo "Usage: bash mlx_local.sh run [standard|sliding|selective_qat|mlp_qat|rowwise_ptq|gptq_lite_ptq]" >&2
+            echo "Usage: bash mlx_local.sh run [standard|sliding|selective_qat|selective_qat_ema|mlp_qat|rowwise_ptq|gptq_lite_ptq]" >&2
             exit 1
             ;;
     esac
@@ -289,6 +327,9 @@ cmd_run() {
     echo "ptq_calib_batches=${ptq_calib_batches}"
     echo "ptq_calib_tokens=${ptq_calib_tokens}"
     echo "ptq_target=${ptq_target}"
+    echo "ema_enabled=${ema_enabled}"
+    echo "ema_decay=${ema_decay}"
+    echo "ema_start_step=${ema_start_step}"
     echo "quantize_only=${quantize_only}"
     echo "load_model_path=${load_model_path:--}"
     echo "muon_weight_decay=${muon_weight_decay}"
@@ -317,6 +358,9 @@ cmd_run() {
     PTQ_CALIB_BATCHES="${ptq_calib_batches}" \
     PTQ_CALIB_TOKENS="${ptq_calib_tokens}" \
     PTQ_TARGET="${ptq_target}" \
+    EMA_ENABLED="${ema_enabled}" \
+    EMA_DECAY="${ema_decay}" \
+    EMA_START_STEP="${ema_start_step}" \
     QUANTIZE_ONLY="${quantize_only}" \
     LOAD_MODEL_PATH="${load_model_path}" \
     MUON_WEIGHT_DECAY="${muon_weight_decay}" \
@@ -330,7 +374,7 @@ cmd_quantize() {
     local mode="${2:-standard}"
 
     if [[ -z "${model_path}" ]]; then
-        echo "Usage: bash mlx_local.sh quantize <model_path> [standard|sliding|rowwise_ptq|gptq_lite_ptq]" >&2
+        echo "Usage: bash mlx_local.sh quantize <model_path> [standard|sliding|selective_qat|rowwise_ptq|gptq_lite_ptq]" >&2
         exit 1
     fi
     if [[ ! -f "${model_path}" ]]; then
