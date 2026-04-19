@@ -125,6 +125,69 @@ python3 train_gpt_mlx.py
 
 Validation always runs on the full `fineweb_val_*` split, which is the fixed first-50k-document set. The smoke command above skips periodic validation and just prints the final `val_loss` and `val_bpb` once at the end.
 
+### Local MLX PTQ Workflow
+
+The local MLX path also includes a small post-training quantization workflow for comparing PTQ methods against the exact same checkpoint.
+
+Train once to produce a raw MLX checkpoint:
+
+```bash
+RUN_ID=mlx_mlp_qat_ref \
+VAL_MAX_BATCHES=8 \
+bash mlx_local.sh run mlp_qat
+```
+
+This writes `logs/mlx_mlp_qat_ref_mlx_model.npz`. You can then quantize that same checkpoint without retraining:
+
+```bash
+RUN_ID=mlx_mlp_qat_rowwise \
+VAL_MAX_BATCHES=8 \
+bash mlx_local.sh quantize logs/mlx_mlp_qat_ref_mlx_model.npz rowwise_ptq
+
+RUN_ID=mlx_mlp_qat_gptq_lite \
+VAL_MAX_BATCHES=8 \
+bash mlx_local.sh quantize logs/mlx_mlp_qat_ref_mlx_model.npz gptq_lite_ptq
+```
+
+The `quantize` command reloads the saved `.npz`, applies the requested PTQ method, exports the quantized artifact, and runs the same final roundtrip evaluation. This is the clean way to compare PTQ methods, because the underlying trained weights are identical across runs. Raw MLX `.npz` checkpoints may contain `bfloat16` tensors; the loader handles those correctly.
+
+For quick local iteration, keep `VAL_MAX_BATCHES=8` so final evaluation finishes in a few seconds. Use `VAL_MAX_BATCHES=0` only for the winner you want to confirm with full validation, since full sliding-window evaluation is much slower.
+
+Current full-eval result on the shared `mlx_mlp_qat_ref` checkpoint:
+
+| Run | Quantized label | `val_bpb` | Delta vs baseline |
+|-----|-----------------|----------:|------------------:|
+| `mlx_mlp_qat_ref_full` | `8+int6:mlp` | 2.35998300 | +0.00000000 |
+| `mlx_mlp_qat_rowwise_full` | `8+int6:mlp+ptq:rowwise` | 2.35765652 | -0.00232648 |
+
+`rowwise_ptq` helps on the `mlp_qat` stack, but it did not transfer to the stronger local selective-int6 recipe. The current best local direction is `selective_qat + late EMA`.
+
+Current full-eval result on the selective-int6 stack:
+
+| Run | Quantized label | `val_bpb` | Delta vs baseline |
+|-----|-----------------|----------:|------------------:|
+| `mlx_selective_qat_ref_full` | `8+int6[2-6]` | 2.34746283 | +0.00000000 |
+| `mlx_selective_qat_ema_ref_full` | `8+int6[2-6]` | 2.23347297 | -0.11398986 |
+
+The recommended local runner for this stack is:
+
+```bash
+RUN_ID=mlx_selective_qat_ema_ref \
+EMA_ENABLED=1 \
+EMA_DECAY=0.98 \
+EMA_START_STEP=150 \
+VAL_MAX_BATCHES=8 \
+bash mlx_local.sh run selective_qat
+```
+
+For convenience, the same defaults are bundled into:
+
+```bash
+bash mlx_local.sh run selective_qat_ema
+```
+
+On this local setup, late EMA was a much stronger improvement than rowwise PTQ, and the quantized artifact also got smaller.
+
 ### Scaling Up to a Remote Machine
 
 Once you're happy with your local tests, or you want more compute, switch to a remote CUDA machine.

@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+usage() {
+    cat <<'EOF'
+Usage:
+  bash mlx_local.sh
+  bash mlx_local.sh setup
+  bash mlx_local.sh download [train_shards]
+  bash mlx_local.sh run [standard|sliding|selective_qat|selective_qat_ema|mlp_qat|rowwise_ptq|gptq_lite_ptq]
+  bash mlx_local.sh quantize <model_path> [standard|sliding|selective_qat|rowwise_ptq|gptq_lite_ptq]
+  bash mlx_local.sh compare <model_path> [stride]
+
+Examples:
+  bash mlx_local.sh
+  bash mlx_local.sh setup
+  bash mlx_local.sh download 1
+  bash mlx_local.sh run standard
+  bash mlx_local.sh run sliding
+  bash mlx_local.sh run selective_qat
+  bash mlx_local.sh run selective_qat_ema
+  bash mlx_local.sh run mlp_qat
+  bash mlx_local.sh run rowwise_ptq
+  bash mlx_local.sh run gptq_lite_ptq
+  bash mlx_local.sh quantize logs/my_run_mlx_model.npz rowwise_ptq
+  bash mlx_local.sh compare logs/my_run_mlx_model.int8.ptz
+
+Optional environment variables for `run`:
+  RUN_ID
+  DATA_PATH
+  TOKENIZER_PATH
+  ITERATIONS
+  TRAIN_BATCH_TOKENS
+  VAL_LOSS_EVERY
+  VAL_BATCH_SIZE
+  VAL_MAX_BATCHES
+  TRAIN_SEQ_LEN
+  EVAL_STRIDE
+  EVAL_BATCH_SEQS
+  QUANT_BITS
+  QUANT_BITS_EMBED
+  QUANT_PACK
+  INT6_SCOPE
+  INT6_LAYER_START
+  INT6_LAYER_END
+  QAT_START_STEP
+  QAT_BITS
+  PTQ_METHOD
+  PTQ_CALIB_BATCHES
+  PTQ_CALIB_TOKENS
+  PTQ_TARGET
+  EMA_ENABLED
+  EMA_DECAY
+  EMA_START_STEP
+  MUON_WEIGHT_DECAY
+  ADAM_WEIGHT_DECAY
+  SEED
+  OUT_DIR
+EOF
+}
+
+ensure_venv_exists() {
+    if [[ ! -d .venv ]]; then
+        echo ".venv not found. Run: bash mlx_local.sh setup" >&2
+        exit 1
+    fi
+}
+
+activate_venv() {
+    # shellcheck disable=SC1091
+    source .venv/bin/activate
+}
+
+check_download_deps() {
+    if ! python3 - <<'PY' >/dev/null 2>&1
+import numpy
+import sentencepiece
+import huggingface_hub
+import datasets
+import tqdm
+PY
+    then
+        echo "Required packages are missing in .venv. Run: bash mlx_local.sh setup" >&2
+        exit 1
+    fi
+}
+
+check_run_deps() {
+    if ! python3 - <<'PY' >/dev/null 2>&1
+import numpy
+import sentencepiece
+import mlx.core
+import mlx.nn
+PY
+    then
+        echo "Required MLX packages are missing in .venv. Run: bash mlx_local.sh setup" >&2
+        exit 1
+    fi
+}
+
+cmd_setup() {
+    if [[ ! -d .venv ]]; then
+        python3 -m venv .venv
+    fi
+
+    activate_venv
+    export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/tmp/pip-cache}"
+
+    python -m pip install --upgrade pip
+    python -m pip install mlx numpy sentencepiece huggingface-hub datasets tqdm
+
+    echo
+    echo "MLX local environment is ready."
+    echo "Next steps:"
+    echo "  bash mlx_local.sh download 1"
+    echo "  bash mlx_local.sh"
+    echo "  bash mlx_local.sh run standard"
+    echo "  bash mlx_local.sh run selective_qat"
+    echo "  bash mlx_local.sh run selective_qat_ema"
+    echo "  bash mlx_local.sh run mlp_qat"
+    echo "  bash mlx_local.sh run rowwise_ptq"
+    echo "  bash mlx_local.sh run gptq_lite_ptq"
+}
+
+cmd_download() {
+    local train_shards="${1:-1}"
+    ensure_venv_exists
+    activate_venv
+    check_download_deps
+
+    python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards "${train_shards}"
+
+    echo
+    echo "Downloaded FineWeb sp1024 data with train_shards=${train_shards}."
+    echo "Dataset path: ./data/datasets/fineweb10B_sp1024"
+    echo "Tokenizer path: ./data/tokenizers/fineweb_1024_bpe.model"
+}
+
+cmd_run() {
+    local mode="${1:-standard}"
+    ensure_venv_exists
+
+    if [[ ! -d ./data/datasets/fineweb10B_sp1024 ]]; then
+        echo "Dataset not found. Run: bash mlx_local.sh download 1" >&2
+        exit 1
+    fi
+
+    activate_venv
+    check_run_deps
+
+    local data_path="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"
+    local tokenizer_path="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
+    local train_seq_len="${TRAIN_SEQ_LEN:-1024}"
+    local iterations="${ITERATIONS:-200}"
+    local train_batch_tokens="${TRAIN_BATCH_TOKENS:-8192}"
+    local val_loss_every="${VAL_LOSS_EVERY:-0}"
+    local val_batch_size="${VAL_BATCH_SIZE:-8192}"
+    local val_max_batches="${VAL_MAX_BATCHES:-0}"
+    local eval_batch_seqs="${EVAL_BATCH_SEQS:-32}"
+    local quant_bits="${QUANT_BITS:-8}"
+    local quant_bits_embed="${QUANT_BITS_EMBED:-8}"
+    local quant_pack="${QUANT_PACK:-0}"
+    local int6_scope="${INT6_SCOPE:-}"
+    local int6_layer_start="${INT6_LAYER_START:--1}"
+    local int6_layer_end="${INT6_LAYER_END:--1}"
+    local qat_start_step="${QAT_START_STEP:--1}"
+    local qat_bits="${QAT_BITS:-0}"
+    local ptq_method="${PTQ_METHOD:-none}"
+    local ptq_calib_batches="${PTQ_CALIB_BATCHES:-1}"
+    local ptq_calib_tokens="${PTQ_CALIB_TOKENS:-0}"
+    local ptq_target="${PTQ_TARGET:-lowbit}"
+    local ema_enabled="${EMA_ENABLED:-0}"
+    local ema_decay="${EMA_DECAY:-0.997}"
+    local ema_start_step="${EMA_START_STEP:--1}"
+    local muon_weight_decay="${MUON_WEIGHT_DECAY:-0.0}"
+    local adam_weight_decay="${ADAM_WEIGHT_DECAY:-0.0}"
+    local seed="${SEED:-1337}"
+    local run_id="${RUN_ID:-mlx_${mode}_$(date +%Y%m%d_%H%M%S)}"
+    local quantize_only="${QUANTIZE_ONLY:-0}"
+    local load_model_path="${LOAD_MODEL_PATH:-}"
+    local eval_stride
+
+    case "${mode}" in
+        standard)
+            eval_stride="${EVAL_STRIDE:-$train_seq_len}"
+            ;;
+        sliding)
+            eval_stride="${EVAL_STRIDE:-64}"
+            ;;
+        selective_qat)
+            eval_stride="${EVAL_STRIDE:-64}"
+            if [[ -z "${QUANT_PACK+x}" ]]; then
+                quant_pack=1
+            fi
+            if [[ -z "${INT6_LAYER_START+x}" ]]; then
+                int6_layer_start=2
+            fi
+            if [[ -z "${INT6_LAYER_END+x}" ]]; then
+                int6_layer_end=6
+            fi
+            if [[ -z "${QAT_START_STEP+x}" ]]; then
+                qat_start_step=150
+            fi
+            if [[ -z "${QAT_BITS+x}" ]]; then
+                qat_bits=0
+            fi
+            ;;
+        selective_qat_ema)
+            eval_stride="${EVAL_STRIDE:-64}"
+            if [[ -z "${QUANT_PACK+x}" ]]; then
+                quant_pack=1
+            fi
+            if [[ -z "${INT6_LAYER_START+x}" ]]; then
+                int6_layer_start=2
+            fi
+            if [[ -z "${INT6_LAYER_END+x}" ]]; then
+                int6_layer_end=6
+            fi
+            if [[ -z "${QAT_START_STEP+x}" ]]; then
+                qat_start_step=150
+            fi
+            if [[ -z "${QAT_BITS+x}" ]]; then
+                qat_bits=0
+            fi
+            if [[ -z "${EMA_ENABLED+x}" ]]; then
+                ema_enabled=1
+            fi
+            if [[ -z "${EMA_DECAY+x}" ]]; then
+                ema_decay=0.98
+            fi
+            if [[ -z "${EMA_START_STEP+x}" ]]; then
+                ema_start_step=150
+            fi
+            if [[ -z "${VAL_MAX_BATCHES+x}" ]]; then
+                val_max_batches=8
+            fi
+            ;;
+        mlp_qat)
+            eval_stride="${EVAL_STRIDE:-64}"
+            if [[ -z "${QUANT_PACK+x}" ]]; then
+                quant_pack=1
+            fi
+            if [[ -z "${INT6_SCOPE+x}" ]]; then
+                int6_scope=mlp
+            fi
+            if [[ -z "${QAT_START_STEP+x}" ]]; then
+                qat_start_step=150
+            fi
+            if [[ -z "${QAT_BITS+x}" ]]; then
+                qat_bits=0
+            fi
+            ;;
+        rowwise_ptq)
+            eval_stride="${EVAL_STRIDE:-64}"
+            if [[ -z "${QUANT_PACK+x}" ]]; then
+                quant_pack=1
+            fi
+            if [[ -z "${INT6_SCOPE+x}" ]]; then
+                int6_scope=mlp
+            fi
+            if [[ -z "${PTQ_METHOD+x}" ]]; then
+                ptq_method=rowwise
+            fi
+            if [[ -z "${PTQ_TARGET+x}" ]]; then
+                ptq_target=lowbit
+            fi
+            if [[ -z "${PTQ_CALIB_BATCHES+x}" ]]; then
+                ptq_calib_batches=4
+            fi
+            if [[ -z "${PTQ_CALIB_TOKENS+x}" ]]; then
+                ptq_calib_tokens=0
+            fi
+            if [[ -z "${VAL_MAX_BATCHES+x}" ]]; then
+                val_max_batches=8
+            fi
+            ;;
+        gptq_lite_ptq)
+            eval_stride="${EVAL_STRIDE:-64}"
+            if [[ -z "${QUANT_PACK+x}" ]]; then
+                quant_pack=1
+            fi
+            if [[ -z "${INT6_SCOPE+x}" ]]; then
+                int6_scope=mlp
+            fi
+            if [[ -z "${PTQ_METHOD+x}" ]]; then
+                ptq_method=gptq_lite
+            fi
+            if [[ -z "${PTQ_TARGET+x}" ]]; then
+                ptq_target=lowbit
+            fi
+            if [[ -z "${PTQ_CALIB_BATCHES+x}" ]]; then
+                ptq_calib_batches=4
+            fi
+            if [[ -z "${PTQ_CALIB_TOKENS+x}" ]]; then
+                ptq_calib_tokens=0
+            fi
+            if [[ -z "${VAL_MAX_BATCHES+x}" ]]; then
+                val_max_batches=8
+            fi
+            ;;
+        *)
+            echo "Usage: bash mlx_local.sh run [standard|sliding|selective_qat|selective_qat_ema|mlp_qat|rowwise_ptq|gptq_lite_ptq]" >&2
+            exit 1
+            ;;
+    esac
+
+    echo "mode=${mode}"
+    echo "run_id=${run_id}"
+    echo "iterations=${iterations}"
+    echo "train_batch_tokens=${train_batch_tokens}"
+    echo "val_batch_size=${val_batch_size}"
+    echo "val_max_batches=${val_max_batches}"
+    echo "train_seq_len=${train_seq_len}"
+    echo "eval_stride=${eval_stride}"
+    echo "eval_batch_seqs=${eval_batch_seqs}"
+    echo "quant_bits=${quant_bits}"
+    echo "quant_bits_embed=${quant_bits_embed}"
+    echo "quant_pack=${quant_pack}"
+    echo "int6_scope=${int6_scope:--}"
+    echo "int6_layer_start=${int6_layer_start}"
+    echo "int6_layer_end=${int6_layer_end}"
+    echo "qat_start_step=${qat_start_step}"
+    echo "qat_bits=${qat_bits}"
+    echo "ptq_method=${ptq_method}"
+    echo "ptq_calib_batches=${ptq_calib_batches}"
+    echo "ptq_calib_tokens=${ptq_calib_tokens}"
+    echo "ptq_target=${ptq_target}"
+    echo "ema_enabled=${ema_enabled}"
+    echo "ema_decay=${ema_decay}"
+    echo "ema_start_step=${ema_start_step}"
+    echo "quantize_only=${quantize_only}"
+    echo "load_model_path=${load_model_path:--}"
+    echo "muon_weight_decay=${muon_weight_decay}"
+    echo "adam_weight_decay=${adam_weight_decay}"
+
+    RUN_ID="${run_id}" \
+    DATA_PATH="${data_path}" \
+    TOKENIZER_PATH="${tokenizer_path}" \
+    ITERATIONS="${iterations}" \
+    TRAIN_BATCH_TOKENS="${train_batch_tokens}" \
+    VAL_LOSS_EVERY="${val_loss_every}" \
+    VAL_BATCH_SIZE="${val_batch_size}" \
+    VAL_MAX_BATCHES="${val_max_batches}" \
+    TRAIN_SEQ_LEN="${train_seq_len}" \
+    EVAL_STRIDE="${eval_stride}" \
+    EVAL_BATCH_SEQS="${eval_batch_seqs}" \
+    QUANT_BITS="${quant_bits}" \
+    QUANT_BITS_EMBED="${quant_bits_embed}" \
+    QUANT_PACK="${quant_pack}" \
+    INT6_SCOPE="${int6_scope}" \
+    INT6_LAYER_START="${int6_layer_start}" \
+    INT6_LAYER_END="${int6_layer_end}" \
+    QAT_START_STEP="${qat_start_step}" \
+    QAT_BITS="${qat_bits}" \
+    PTQ_METHOD="${ptq_method}" \
+    PTQ_CALIB_BATCHES="${ptq_calib_batches}" \
+    PTQ_CALIB_TOKENS="${ptq_calib_tokens}" \
+    PTQ_TARGET="${ptq_target}" \
+    EMA_ENABLED="${ema_enabled}" \
+    EMA_DECAY="${ema_decay}" \
+    EMA_START_STEP="${ema_start_step}" \
+    QUANTIZE_ONLY="${quantize_only}" \
+    LOAD_MODEL_PATH="${load_model_path}" \
+    MUON_WEIGHT_DECAY="${muon_weight_decay}" \
+    ADAM_WEIGHT_DECAY="${adam_weight_decay}" \
+    SEED="${seed}" \
+    python3 train_gpt_mlx.py
+}
+
+cmd_quantize() {
+    local model_path="${1:-}"
+    local mode="${2:-standard}"
+
+    if [[ -z "${model_path}" ]]; then
+        echo "Usage: bash mlx_local.sh quantize <model_path> [standard|sliding|selective_qat|rowwise_ptq|gptq_lite_ptq]" >&2
+        exit 1
+    fi
+    if [[ ! -f "${model_path}" ]]; then
+        echo "Model file not found: ${model_path}" >&2
+        exit 1
+    fi
+
+    local run_id="${RUN_ID:-mlx_quantize_${mode}_$(date +%Y%m%d_%H%M%S)}"
+    echo "quantize_model=${model_path}"
+    QUANTIZE_ONLY=1 LOAD_MODEL_PATH="${model_path}" RUN_ID="${run_id}" cmd_run "${mode}"
+}
+
+cmd_compare() {
+    local model_path="${1:-}"
+    local sliding_stride="${2:-64}"
+    ensure_venv_exists
+
+    if [[ -z "${model_path}" ]]; then
+        echo "Usage: bash mlx_local.sh compare <model_path> [stride]" >&2
+        exit 1
+    fi
+    if [[ ! -f "${model_path}" ]]; then
+        echo "Model file not found: ${model_path}" >&2
+        exit 1
+    fi
+    if [[ ! -d ./data/datasets/fineweb10B_sp1024 ]]; then
+        echo "Dataset not found. Run: bash mlx_local.sh download 1" >&2
+        exit 1
+    fi
+
+    activate_venv
+    check_run_deps
+
+    local data_path="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"
+    local tokenizer_path="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
+    local train_seq_len="${TRAIN_SEQ_LEN:-1024}"
+    local iterations="${ITERATIONS:-0}"
+    local train_batch_tokens="${TRAIN_BATCH_TOKENS:-8192}"
+    local val_loss_every="${VAL_LOSS_EVERY:-0}"
+    local val_batch_size="${VAL_BATCH_SIZE:-8192}"
+    local eval_batch_seqs="${EVAL_BATCH_SEQS:-32}"
+    local seed="${SEED:-1337}"
+    local out_dir="${OUT_DIR:-logs}"
+    local run_base="${RUN_ID_BASE:-mlx_compare_$(date +%Y%m%d_%H%M%S)}"
+    local std_run_id="${run_base}_standard"
+    local slide_run_id="${run_base}_sliding"
+    local std_log="${out_dir}/${std_run_id}.txt"
+    local slide_log="${out_dir}/${slide_run_id}.txt"
+
+    echo "compare_model=${model_path}"
+    echo "standard_run_id=${std_run_id}"
+    echo "sliding_run_id=${slide_run_id}"
+    echo "sliding_stride=${sliding_stride}"
+    echo "eval_batch_seqs=${eval_batch_seqs}"
+
+    RUN_ID="${std_run_id}" \
+    OUT_DIR="${out_dir}" \
+    DATA_PATH="${data_path}" \
+    TOKENIZER_PATH="${tokenizer_path}" \
+    ITERATIONS="${iterations}" \
+    TRAIN_BATCH_TOKENS="${train_batch_tokens}" \
+    VAL_LOSS_EVERY="${val_loss_every}" \
+    VAL_BATCH_SIZE="${val_batch_size}" \
+    TRAIN_SEQ_LEN="${train_seq_len}" \
+    EVAL_STRIDE="${train_seq_len}" \
+    EVAL_BATCH_SEQS="${eval_batch_seqs}" \
+    SEED="${seed}" \
+    EVAL_ONLY=1 \
+    LOAD_MODEL_PATH="${model_path}" \
+    python3 train_gpt_mlx.py
+
+    RUN_ID="${slide_run_id}" \
+    OUT_DIR="${out_dir}" \
+    DATA_PATH="${data_path}" \
+    TOKENIZER_PATH="${tokenizer_path}" \
+    ITERATIONS="${iterations}" \
+    TRAIN_BATCH_TOKENS="${train_batch_tokens}" \
+    VAL_LOSS_EVERY="${val_loss_every}" \
+    VAL_BATCH_SIZE="${val_batch_size}" \
+    TRAIN_SEQ_LEN="${train_seq_len}" \
+    EVAL_STRIDE="${sliding_stride}" \
+    EVAL_BATCH_SEQS="${eval_batch_seqs}" \
+    SEED="${seed}" \
+    EVAL_ONLY=1 \
+    LOAD_MODEL_PATH="${model_path}" \
+    python3 train_gpt_mlx.py
+
+    STD_LOG="${std_log}" SLIDE_LOG="${slide_log}" python3 - <<'PY'
+import pathlib
+import re
+import os
+
+std_log = pathlib.Path(os.environ["STD_LOG"])
+slide_log = pathlib.Path(os.environ["SLIDE_LOG"])
+new_pat = re.compile(r"final_quantized_roundtrip_exact bits:(\\S+) val_loss:(\\S+) val_bpb:(\\S+)")
+new_time_pat = re.compile(r"final_quantized_roundtrip bits:(\\S+) val_loss:\\S+ val_bpb:\\S+ eval_time:(\\S+)ms")
+old_pat = re.compile(r"final_int8_zlib_roundtrip_exact val_loss:(\\S+) val_bpb:(\\S+)")
+old_time_pat = re.compile(r"final_int8_zlib_roundtrip val_loss:\\S+ val_bpb:\\S+ eval_time:(\\S+)ms")
+
+def extract(path: pathlib.Path):
+    text = path.read_text(encoding="utf-8")
+    m = new_pat.search(text)
+    t = new_time_pat.search(text)
+    if m and t:
+        return m.group(1), float(m.group(2)), float(m.group(3)), float(t.group(2))
+    m = old_pat.search(text)
+    t = old_time_pat.search(text)
+    if m and t:
+        return "8", float(m.group(1)), float(m.group(2)), float(t.group(1))
+    raise SystemExit(f"Could not parse final metrics from {path}")
+
+std_bits, std_loss, std_bpb, std_ms = extract(std_log)
+slide_bits, slide_loss, slide_bpb, slide_ms = extract(slide_log)
+print("")
+print("Comparison")
+print(f"  standard bits={std_bits} loss={std_loss:.8f} bpb={std_bpb:.8f} eval_ms={std_ms:.0f}")
+print(f"  sliding  bits={slide_bits} loss={slide_loss:.8f} bpb={slide_bpb:.8f} eval_ms={slide_ms:.0f}")
+print(f"  delta_loss={slide_loss - std_loss:+.8f}")
+print(f"  delta_bpb={slide_bpb - std_bpb:+.8f}")
+print(f"  eval_time_ratio={slide_ms / std_ms:.3f}x")
+PY
+}
+
+main() {
+    local cmd="${1:-}"
+    case "${cmd}" in
+        "")
+            cmd_run "${MLX_LOCAL_MODE:-sliding}"
+            ;;
+        setup)
+            shift
+            cmd_setup "$@"
+            ;;
+        download)
+            shift
+            cmd_download "$@"
+            ;;
+        run)
+            shift
+            cmd_run "$@"
+            ;;
+        quantize)
+            shift
+            cmd_quantize "$@"
+            ;;
+        compare)
+            shift
+            cmd_compare "$@"
+            ;;
+        -h|--help|help)
+            usage
+            ;;
+        *)
+            echo "Unknown command: ${cmd}" >&2
+            echo >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
